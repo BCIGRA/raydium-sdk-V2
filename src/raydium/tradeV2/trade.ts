@@ -1,55 +1,52 @@
-import { PublicKey, EpochInfo } from "@solana/web3.js";
-import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, createTransferInstruction } from "@solana/spl-token";
+import { EpochInfo, PublicKey } from "@solana/web3.js";
+import { createTransferInstruction, TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
+import BN from "bn.js";
+import Decimal from "decimal.js";
+import { AmmV4Keys, ApiV3Token, ClmmKeys, PoolKeys } from "@/api";
 import {
-  WSOLMint,
   AMM_V4,
+  BigNumberish,
   CLMM_PROGRAM_ID,
   CREATE_CPMM_POOL_PROGRAM,
-  minExpirationTime,
-  getMultipleAccountsInfoWithCustomFlags,
-  solToWSol,
   fetchMultipleMintInfos,
+  getMultipleAccountsInfoWithCustomFlags,
+  minExpirationTime,
+  parseBigNumberish,
+  solToWSol,
+  WSOLMint,
 } from "@/common";
+import { MakeMultiTxData, MakeTxData } from "@/common/txTool/txTool";
 import { InstructionType, TxVersion } from "@/common/txTool/txType";
-import { MakeTxData, MakeMultiTxData } from "@/common/txTool/txTool";
-import ModuleBase, { ModuleBaseProps } from "../moduleBase";
-import { BigNumberish, parseBigNumberish } from "@/common/bignumber";
+import { publicKey, struct } from "../../marshmallow";
+import { Price, TokenAmount } from "../../module";
+import { ClmmRpcData, ComputeClmmPoolInfo, PoolUtils, ReturnTypeFetchMultiplePoolTickArrays } from "../../raydium/clmm";
+import { PoolInfoLayout } from "../../raydium/clmm/layout";
+import { CpmmPoolInfoLayout, getPdaPoolAuthority } from "../../raydium/cpmm";
 import {
-  createWSolAccountInstructions,
-  closeAccountInstruction,
-  makeTransferInstruction,
-} from "../account/instruction";
-import { TokenAccount } from "../account/types";
-import { ComputeBudgetConfig, ReturnTypeFetchMultipleMintInfos } from "@/raydium/type";
-import {
-  getLiquidityAssociatedAuthority,
   ComputeAmountOutParam,
+  getLiquidityAssociatedAuthority,
   liquidityStateV4Layout,
   toAmmComputePoolInfo,
-} from "@/raydium/liquidity";
-import { PoolInfoLayout } from "@/raydium/clmm/layout";
-import { CpmmPoolInfoLayout, getPdaPoolAuthority } from "@/raydium/cpmm";
-import { ReturnTypeFetchMultiplePoolTickArrays, PoolUtils, ClmmRpcData, ComputeClmmPoolInfo } from "@/raydium/clmm";
-import { struct, publicKey } from "@/marshmallow";
+} from "../../raydium/liquidity";
+import { ComputeBudgetConfig, ReturnTypeFetchMultipleMintInfos } from "../../raydium/type";
+import { closeAccountInstruction, createWSolAccountInstructions, makeTransferInstruction } from "../account/instruction";
+import { TokenAccount } from "../account/types";
+import { CpmmComputeData } from "../cpmm";
+import { AmmRpcData } from "../liquidity";
+import ModuleBase, { ModuleBaseProps } from "../moduleBase";
+import { Market, MARKET_STATE_LAYOUT_V3 } from "../serum";
+import { toApiV3Token, toToken, toTokenAmount } from "../token";
+import { makeSwapInstruction } from "./instrument";
 import {
-  ReturnTypeGetAllRoute,
   BasicPoolInfo,
-  RoutePathType,
-  ReturnTypeFetchMultipleInfo,
-  ComputeAmountOutLayout,
   ComputeAmountOutAmmLayout,
+  ComputeAmountOutLayout,
   ComputePoolType,
   ComputeRoutePathType,
+  ReturnTypeFetchMultipleInfo,
+  ReturnTypeGetAllRoute,
+  RoutePathType,
 } from "./type";
-import { TokenAmount, Price } from "@/module";
-import BN from "bn.js";
-import { AmmV4Keys, ApiV3Token, ClmmKeys, PoolKeys } from "@/api";
-import { toApiV3Token, toToken, toTokenAmount } from "../token";
-import Decimal from "decimal.js";
-import { makeSwapInstruction } from "./instrument";
-import { AmmRpcData } from "../liquidity";
-import { MARKET_STATE_LAYOUT_V3, Market } from "../serum";
-import { CpmmComputeData } from "../cpmm";
 
 const ZERO = new BN(0);
 export default class TradeV2 extends ModuleBase {
@@ -112,13 +109,6 @@ export default class TradeV2 extends ModuleBase {
             }),
           ],
         });
-        makeTransferInstruction({
-          destination: ins.addresses.newAccount,
-          source: tokenAccounts[i].publicKey!,
-          amount: amountBN,
-          owner: this.scope.ownerPubKey,
-          tokenProgram,
-        });
       }
     }
 
@@ -133,6 +123,7 @@ export default class TradeV2 extends ModuleBase {
     const tokenAccounts = await this.getWSolAccounts();
 
     const txBuilder = this.createTxBuilder();
+
     const ins = await createWSolAccountInstructions({
       connection: this.scope.connection,
       owner: this.scope.ownerPubKey,
@@ -147,7 +138,6 @@ export default class TradeV2 extends ModuleBase {
       txBuilder.addInstruction({
         instructions: [
           makeTransferInstruction({
-            // destination: ins.signers![0].publicKey,
             destination: tokenAccounts[0].publicKey!,
             source: ins.addresses.newAccount,
             amount,
@@ -178,7 +168,7 @@ export default class TradeV2 extends ModuleBase {
   }: {
     txVersion: T;
     swapInfo: ComputeAmountOutLayout;
-    swapPoolKeys?: PoolKeys[];
+    swapPoolKeys?: PoolKeys[];  // Pastikan ini adalah array PoolKeys
     ownerInfo: {
       associatedOnly: boolean;
       checkCreateATAOwner: boolean;
@@ -195,6 +185,7 @@ export default class TradeV2 extends ModuleBase {
     const inputMint = amountIn.amount.token.mint;
     const outputMint = amountOut.amount.token.mint;
 
+    // Mendapatkan atau membuat akun token sumber
     const { account: sourceAcc, instructionParams: sourceAccInsParams } =
       await this.scope.account.getOrCreateTokenAccount({
         tokenProgram: amountIn.amount.token.isToken2022 ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID,
@@ -202,12 +193,10 @@ export default class TradeV2 extends ModuleBase {
         notUseTokenAccount: useSolBalance,
         owner: this.scope.ownerPubKey,
         skipCloseAccount: !useSolBalance,
-        createInfo: useSolBalance
-          ? {
-              payer: this.scope.ownerPubKey,
-              amount: amountIn.amount.raw,
-            }
-          : undefined,
+        createInfo: useSolBalance ? {
+          payer: this.scope.ownerPubKey,
+          amount: amountIn.amount.raw,
+        } : undefined,
         associatedOnly: useSolBalance ? false : ownerInfo.associatedOnly,
         checkCreateATAOwner: ownerInfo.checkCreateATAOwner,
       });
@@ -218,11 +207,12 @@ export default class TradeV2 extends ModuleBase {
       throw Error("input account check error");
     }
 
+    // Menentukan akun tujuan
     let destinationAcc: PublicKey;
-    if (swapInfo.routeType === "route" && isOutputSol) {
+    if (swapInfo.routeType === "route") {
       destinationAcc = this.scope.account.getAssociatedTokenAccount(
         outputMint,
-        amountOut.amount.token.isToken2022 ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID,
+        amountOut.amount.token.isToken2022 ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID
       );
     } else {
       const { account, instructionParams } = await this.scope.account.getOrCreateTokenAccount({
@@ -238,10 +228,12 @@ export default class TradeV2 extends ModuleBase {
         associatedOnly: isOutputSol ? false : ownerInfo.associatedOnly,
         checkCreateATAOwner: ownerInfo.checkCreateATAOwner,
       });
+
       destinationAcc = account!;
       instructionParams && txBuilder.addInstruction(instructionParams);
     }
 
+    // Menambahkan instruksi penutupan akun jika outputnya adalah SOL
     if (isOutputSol) {
       txBuilder.addInstruction({
         endInstructions: [
@@ -256,16 +248,20 @@ export default class TradeV2 extends ModuleBase {
       });
     }
 
+    // Menyiapkan akun token tengah jika rute adalah "route"
     let routeTokenAcc: PublicKey | undefined = undefined;
     if (swapInfo.routeType === "route") {
       const middleMint = swapInfo.middleToken;
       routeTokenAcc = this.scope.account.getAssociatedTokenAccount(
         middleMint.mint,
-        middleMint.isToken2022 ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID,
+        middleMint.isToken2022 ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID
       );
     }
 
+    // Hitung likuiditas dan urutkan pool berdasarkan likuiditas
     const poolKeys = swapPoolKeys ? swapPoolKeys : await this.computePoolToPoolKeys({ pools: swapInfo.poolInfoList });
+
+    // Instruksi swap
     const swapIns = makeSwapInstruction({
       routeProgram,
       inputMint,
@@ -283,6 +279,7 @@ export default class TradeV2 extends ModuleBase {
       },
     });
 
+    // Menangani biaya jika ada
     if (swapInfo.feeConfig !== undefined) {
       const checkTxBuilder = this.createTxBuilder();
       checkTxBuilder.addInstruction({
@@ -291,7 +288,7 @@ export default class TradeV2 extends ModuleBase {
             sourceAcc,
             swapInfo.feeConfig.feeAccount,
             this.scope.ownerPubKey,
-            swapInfo.feeConfig.feeAmount.toNumber(),
+            swapInfo.feeConfig.feeAmount.toNumber()
           ),
         ],
         instructionTypes: [InstructionType.TransferAmount],
@@ -299,7 +296,10 @@ export default class TradeV2 extends ModuleBase {
       checkTxBuilder.addInstruction(swapIns);
 
       const { transactions } =
-        txVersion === TxVersion.V0 ? await checkTxBuilder.sizeCheckBuildV0() : await checkTxBuilder.sizeCheckBuild();
+        txVersion === TxVersion.V0
+          ? await checkTxBuilder.sizeCheckBuildV0()
+          : await checkTxBuilder.sizeCheckBuild();
+
       if (transactions.length < 2) {
         txBuilder.addInstruction({
           instructions: [
@@ -307,21 +307,179 @@ export default class TradeV2 extends ModuleBase {
               sourceAcc,
               swapInfo.feeConfig.feeAccount,
               this.scope.ownerPubKey,
-              swapInfo.feeConfig.feeAmount.toNumber(),
+              swapInfo.feeConfig.feeAmount.toNumber()
             ),
           ],
           instructionTypes: [InstructionType.TransferAmount],
         });
       }
     }
+
+    // Menambahkan instruksi swap ke dalam transaksi utama
     txBuilder.addInstruction(swapIns);
 
-    if (txVersion === TxVersion.V0)
-      return txBuilder.sizeCheckBuildV0({ computeBudgetConfig, address: swapIns.address }) as Promise<
-        MakeMultiTxData<T>
-      >;
+    // Membuat transaksi berdasarkan versi yang diminta
+    if (txVersion === TxVersion.V0) {
+      return txBuilder.sizeCheckBuildV0({ computeBudgetConfig, address: swapIns.address }) as Promise<MakeMultiTxData<T>>;
+    }
+
     return txBuilder.sizeCheckBuild({ computeBudgetConfig, address: swapIns.address }) as Promise<MakeMultiTxData<T>>;
   }
+
+  // public async swap<T extends TxVersion>({
+  //   swapInfo,
+  //   swapPoolKeys,
+  //   ownerInfo,
+  //   computeBudgetConfig,
+  //   routeProgram,
+  //   txVersion,
+  // }: {
+  //   txVersion: T;
+  //   swapInfo: ComputeAmountOutLayout;
+  //   swapPoolKeys?: PoolKeys[];
+  //   ownerInfo: {
+  //     associatedOnly: boolean;
+  //     checkCreateATAOwner: boolean;
+  //   };
+  //   routeProgram: PublicKey;
+  //   computeBudgetConfig?: ComputeBudgetConfig;
+  // }): Promise<MakeMultiTxData<T>> {
+  //   const txBuilder = this.createTxBuilder();
+
+  //   const amountIn = swapInfo.amountIn;
+  //   const amountOut = swapInfo.amountOut;
+  //   const useSolBalance = amountIn.amount.token.mint.equals(WSOLMint);
+  //   const isOutputSol = amountOut.amount.token.mint.equals(WSOLMint);
+  //   const inputMint = amountIn.amount.token.mint;
+  //   const outputMint = amountOut.amount.token.mint;
+
+  //   const { account: sourceAcc, instructionParams: sourceAccInsParams } =
+  //     await this.scope.account.getOrCreateTokenAccount({
+  //       tokenProgram: amountIn.amount.token.isToken2022 ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID,
+  //       mint: inputMint,
+  //       notUseTokenAccount: useSolBalance,
+  //       owner: this.scope.ownerPubKey,
+  //       skipCloseAccount: !useSolBalance,
+  //       createInfo: useSolBalance
+  //         ? {
+  //           payer: this.scope.ownerPubKey,
+  //           amount: amountIn.amount.raw,
+  //         }
+  //         : undefined,
+  //       associatedOnly: useSolBalance ? false : ownerInfo.associatedOnly,
+  //       checkCreateATAOwner: ownerInfo.checkCreateATAOwner,
+  //     });
+
+  //   sourceAccInsParams && txBuilder.addInstruction(sourceAccInsParams);
+
+  //   if (sourceAcc === undefined) {
+  //     throw Error("input account check error");
+  //   }
+
+  //   let destinationAcc: PublicKey;
+  //   if (swapInfo.routeType === "route") {
+  //     destinationAcc = this.scope.account.getAssociatedTokenAccount(
+  //       outputMint,
+  //       amountOut.amount.token.isToken2022 ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID,
+  //     );
+  //   } else {
+  //     const { account, instructionParams } = await this.scope.account.getOrCreateTokenAccount({
+  //       tokenProgram: amountOut.amount.token.isToken2022 ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID,
+  //       mint: outputMint,
+  //       notUseTokenAccount: isOutputSol,
+  //       owner: this.scope.ownerPubKey,
+  //       skipCloseAccount: true,
+  //       createInfo: {
+  //         payer: this.scope.ownerPubKey,
+  //         amount: 0,
+  //       },
+  //       associatedOnly: isOutputSol ? false : ownerInfo.associatedOnly,
+  //       checkCreateATAOwner: ownerInfo.checkCreateATAOwner,
+  //     });
+  //     destinationAcc = account!;
+  //     instructionParams && txBuilder.addInstruction(instructionParams);
+  //   }
+
+  //   if (isOutputSol) {
+  //     txBuilder.addInstruction({
+  //       endInstructions: [
+  //         closeAccountInstruction({
+  //           owner: this.scope.ownerPubKey,
+  //           payer: this.scope.ownerPubKey,
+  //           tokenAccount: destinationAcc,
+  //           programId: TOKEN_PROGRAM_ID,
+  //         }),
+  //       ],
+  //       endInstructionTypes: [InstructionType.CloseAccount],
+  //     });
+  //   }
+
+  //   let routeTokenAcc: PublicKey | undefined = undefined;
+  //   if (swapInfo.routeType === "route") {
+  //     const middleMint = swapInfo.middleToken;
+  //     routeTokenAcc = this.scope.account.getAssociatedTokenAccount(
+  //       middleMint.mint,
+  //       middleMint.isToken2022 ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID,
+  //     );
+  //   }
+
+  //   const poolKeys = swapPoolKeys ? swapPoolKeys : await this.computePoolToPoolKeys({ pools: swapInfo.poolInfoList });
+  //   const swapIns = makeSwapInstruction({
+  //     routeProgram,
+  //     inputMint,
+  //     swapInfo: {
+  //       ...swapInfo,
+  //       poolInfo: [...swapInfo.poolInfoList],
+  //       poolKey: poolKeys,
+  //       outputMint,
+  //     },
+  //     ownerInfo: {
+  //       wallet: this.scope.ownerPubKey,
+  //       sourceToken: sourceAcc,
+  //       routeToken: routeTokenAcc,
+  //       destinationToken: destinationAcc!,
+  //     },
+  //   });
+
+  //   if (swapInfo.feeConfig !== undefined) {
+  //     const checkTxBuilder = this.createTxBuilder();
+  //     checkTxBuilder.addInstruction({
+  //       instructions: [
+  //         createTransferInstruction(
+  //           sourceAcc,
+  //           swapInfo.feeConfig.feeAccount,
+  //           this.scope.ownerPubKey,
+  //           swapInfo.feeConfig.feeAmount.toNumber(),
+  //         ),
+  //       ],
+  //       instructionTypes: [InstructionType.TransferAmount],
+  //     });
+  //     checkTxBuilder.addInstruction(swapIns);
+
+  //     const { transactions } =
+  //       txVersion === TxVersion.V0 ? await checkTxBuilder.sizeCheckBuildV0() : await checkTxBuilder.sizeCheckBuild();
+  //     if (transactions.length < 2) {
+  //       txBuilder.addInstruction({
+  //         instructions: [
+  //           createTransferInstruction(
+  //             sourceAcc,
+  //             swapInfo.feeConfig.feeAccount,
+  //             this.scope.ownerPubKey,
+  //             swapInfo.feeConfig.feeAmount.toNumber(),
+  //           ),
+  //         ],
+  //         instructionTypes: [InstructionType.TransferAmount],
+  //       });
+  //     }
+  //   }
+  //   txBuilder.addInstruction(swapIns);
+
+  //   if (txVersion === TxVersion.V0)
+  //     return txBuilder.sizeCheckBuildV0({ computeBudgetConfig, address: swapIns.address }) as Promise<
+  //       MakeMultiTxData<T>
+  //     >;
+  //   return txBuilder.sizeCheckBuild({ computeBudgetConfig, address: swapIns.address }) as Promise<MakeMultiTxData<T>>;
+  // }
 
   // get all amm/clmm/cpmm pools data only with id and mint
   public async fetchRoutePoolBasicInfo(programIds?: { amm: PublicKey; clmm: PublicKey; cpmm: PublicKey }): Promise<{
@@ -379,7 +537,6 @@ export default class TradeV2 extends ModuleBase {
     };
   }
 
-  // get pools with in routes
   public getAllRoute({
     inputMint,
     outputMint,
@@ -393,6 +550,7 @@ export default class TradeV2 extends ModuleBase {
     ammPools: BasicPoolInfo[];
     cpmmPools: BasicPoolInfo[];
   }): ReturnTypeGetAllRoute {
+    // Jika input atau output mint adalah default, ganti dengan WSOLMint
     inputMint = inputMint.toString() === PublicKey.default.toString() ? WSOLMint : inputMint;
     outputMint = outputMint.toString() === PublicKey.default.toString() ? WSOLMint : outputMint;
 
@@ -401,10 +559,11 @@ export default class TradeV2 extends ModuleBase {
     const cpmmPoolList: { [poolKey: string]: BasicPoolInfo } = {};
 
     const directPath: BasicPoolInfo[] = [];
+    const routePathDict: RoutePathType = {}; // Simpan informasi rute
 
-    const routePathDict: RoutePathType = {}; // {[route mint: string]: {in: [] , out: []}}
-
+    // Iterasi melalui CLMM Pools
     for (const itemClmmPool of clmmPools ?? []) {
+      // Menambahkan pool yang cocok dengan input dan output mint ke directPath
       if (
         (itemClmmPool.mintA.equals(inputMint) && itemClmmPool.mintB.equals(outputMint)) ||
         (itemClmmPool.mintA.equals(outputMint) && itemClmmPool.mintB.equals(inputMint))
@@ -413,14 +572,15 @@ export default class TradeV2 extends ModuleBase {
         needTickArray[itemClmmPool.id.toString()] = itemClmmPool;
       }
 
+      // Mengelompokkan pool berdasarkan mint yang terhubung ke inputMint dan outputMint
       if (itemClmmPool.mintA.equals(inputMint)) {
         const t = itemClmmPool.mintB.toString();
         if (routePathDict[t] === undefined)
           routePathDict[t] = {
-            mintProgram: TOKEN_PROGRAM_ID, // to fetch later
+            mintProgram: TOKEN_PROGRAM_ID,
             in: [],
             out: [],
-            mDecimals: 0, // to fetch later
+            mDecimals: 0, // Placeholder untuk kemudian diambil
           };
         routePathDict[t].in.push(itemClmmPool);
       }
@@ -428,10 +588,10 @@ export default class TradeV2 extends ModuleBase {
         const t = itemClmmPool.mintA.toString();
         if (routePathDict[t] === undefined)
           routePathDict[t] = {
-            mintProgram: TOKEN_PROGRAM_ID, // to fetch later
+            mintProgram: TOKEN_PROGRAM_ID,
             in: [],
             out: [],
-            mDecimals: 0, // to fetch later
+            mDecimals: 0,
           };
         routePathDict[t].in.push(itemClmmPool);
       }
@@ -439,10 +599,10 @@ export default class TradeV2 extends ModuleBase {
         const t = itemClmmPool.mintB.toString();
         if (routePathDict[t] === undefined)
           routePathDict[t] = {
-            mintProgram: TOKEN_PROGRAM_ID, // to fetch later
+            mintProgram: TOKEN_PROGRAM_ID,
             in: [],
             out: [],
-            mDecimals: 0, // to fetch later
+            mDecimals: 0,
           };
         routePathDict[t].out.push(itemClmmPool);
       }
@@ -450,18 +610,19 @@ export default class TradeV2 extends ModuleBase {
         const t = itemClmmPool.mintA.toString();
         if (routePathDict[t] === undefined)
           routePathDict[t] = {
-            mintProgram: TOKEN_PROGRAM_ID, // to fetch later
+            mintProgram: TOKEN_PROGRAM_ID,
             in: [],
             out: [],
-            mDecimals: 0, // to fetch later
+            mDecimals: 0,
           };
         routePathDict[t].out.push(itemClmmPool);
       }
     }
 
+    // Iterasi melalui AMM Pools
     const addLiquidityPools: BasicPoolInfo[] = [];
-
     for (const itemAmmPool of ammPools) {
+      // Menambahkan pool AMM yang cocok ke directPath
       if (
         (itemAmmPool.mintA.equals(inputMint) && itemAmmPool.mintB.equals(outputMint)) ||
         (itemAmmPool.mintA.equals(outputMint) && itemAmmPool.mintB.equals(inputMint))
@@ -470,13 +631,15 @@ export default class TradeV2 extends ModuleBase {
         needSimulate[itemAmmPool.id.toBase58()] = itemAmmPool;
         addLiquidityPools.push(itemAmmPool);
       }
+
+      // Menyusun rute berdasarkan mint
       if (itemAmmPool.mintA.equals(inputMint)) {
         if (routePathDict[itemAmmPool.mintB.toBase58()] === undefined)
           routePathDict[itemAmmPool.mintB.toBase58()] = {
             mintProgram: TOKEN_PROGRAM_ID,
             in: [],
             out: [],
-            mDecimals: 0, // to fetch later
+            mDecimals: 0,
           };
         routePathDict[itemAmmPool.mintB.toBase58()].in.push(itemAmmPool);
       }
@@ -486,7 +649,7 @@ export default class TradeV2 extends ModuleBase {
             mintProgram: TOKEN_PROGRAM_ID,
             in: [],
             out: [],
-            mDecimals: 0, // to fetch later
+            mDecimals: 0,
           };
         routePathDict[itemAmmPool.mintA.toBase58()].in.push(itemAmmPool);
       }
@@ -496,7 +659,7 @@ export default class TradeV2 extends ModuleBase {
             mintProgram: TOKEN_PROGRAM_ID,
             in: [],
             out: [],
-            mDecimals: 0, // to fetch later
+            mDecimals: 0,
           };
         routePathDict[itemAmmPool.mintB.toBase58()].out.push(itemAmmPool);
       }
@@ -506,12 +669,13 @@ export default class TradeV2 extends ModuleBase {
             mintProgram: TOKEN_PROGRAM_ID,
             in: [],
             out: [],
-            mDecimals: 0, // to fetch later
+            mDecimals: 0,
           };
         routePathDict[itemAmmPool.mintA.toBase58()].out.push(itemAmmPool);
       }
     }
 
+    // Iterasi melalui CPMM Pools
     for (const itemCpmmPool of cpmmPools) {
       if (
         (itemCpmmPool.mintA.equals(inputMint) && itemCpmmPool.mintB.equals(outputMint)) ||
@@ -520,13 +684,14 @@ export default class TradeV2 extends ModuleBase {
         directPath.push(itemCpmmPool);
         cpmmPoolList[itemCpmmPool.id.toBase58()] = itemCpmmPool;
       }
+      // Menyusun rute berdasarkan mint untuk CPMM Pools
       if (itemCpmmPool.mintA.equals(inputMint)) {
         if (routePathDict[itemCpmmPool.mintB.toBase58()] === undefined)
           routePathDict[itemCpmmPool.mintB.toBase58()] = {
             mintProgram: TOKEN_PROGRAM_ID,
             in: [],
             out: [],
-            mDecimals: 0, // to fetch later
+            mDecimals: 0,
           };
         routePathDict[itemCpmmPool.mintB.toBase58()].in.push(itemCpmmPool);
       }
@@ -536,7 +701,7 @@ export default class TradeV2 extends ModuleBase {
             mintProgram: TOKEN_PROGRAM_ID,
             in: [],
             out: [],
-            mDecimals: 0, // to fetch later
+            mDecimals: 0,
           };
         routePathDict[itemCpmmPool.mintA.toBase58()].in.push(itemCpmmPool);
       }
@@ -546,7 +711,7 @@ export default class TradeV2 extends ModuleBase {
             mintProgram: TOKEN_PROGRAM_ID,
             in: [],
             out: [],
-            mDecimals: 0, // to fetch later
+            mDecimals: 0,
           };
         routePathDict[itemCpmmPool.mintB.toBase58()].out.push(itemCpmmPool);
       }
@@ -556,27 +721,27 @@ export default class TradeV2 extends ModuleBase {
             mintProgram: TOKEN_PROGRAM_ID,
             in: [],
             out: [],
-            mDecimals: 0, // to fetch later
+            mDecimals: 0,
           };
         routePathDict[itemCpmmPool.mintA.toBase58()].out.push(itemCpmmPool);
       }
     }
 
+    // Menyaring rute yang tidak valid
     for (const t of Object.keys(routePathDict)) {
+      const info = routePathDict[t];
       if (
-        routePathDict[t].in.length === 1 &&
-        routePathDict[t].out.length === 1 &&
-        routePathDict[t].in[0].id.equals(routePathDict[t].out[0].id)
+        info.in.length === 1 &&
+        info.out.length === 1 &&
+        info.in[0].id.equals(info.out[0].id)
       ) {
         delete routePathDict[t];
         continue;
       }
-      if (routePathDict[t].in.length === 0 || routePathDict[t].out.length === 0) {
+      if (info.in.length === 0 || info.out.length === 0) {
         delete routePathDict[t];
         continue;
       }
-
-      const info = routePathDict[t];
 
       for (const infoIn of info.in) {
         for (const infoOut of info.out) {
@@ -614,7 +779,6 @@ export default class TradeV2 extends ModuleBase {
     };
   }
 
-  // fetch pools detail info in route
   public async fetchSwapRoutesData({
     routes,
     inputMint,
@@ -634,15 +798,19 @@ export default class TradeV2 extends ModuleBase {
     routePathDict: ComputeRoutePathType;
   }> {
     const mintSet = new Set([
-      ...routes.needTickArray.map((p) => [p.mintA.toBase58(), p.mintB.toBase58()]).flat(),
+      ...routes.needTickArray.flatMap((p) => [p.mintA.toBase58(), p.mintB.toBase58()]),
       inputMint.toString(),
       outputMint.toString(),
     ]);
 
     console.log("fetching amm pools info, total: ", routes.needSimulate.length);
-    const ammPoolsRpcInfo = await this.scope.liquidity.getRpcPoolInfos(routes.needSimulate.map((p) => p.id));
+    // Fetch AMM Pools Info
+    const ammPoolsRpcInfo = await this.scope.liquidity.getRpcPoolInfos(
+      routes.needSimulate.map((p) => p.id),
+    );
     const ammSimulateCache = toAmmComputePoolInfo(ammPoolsRpcInfo);
 
+    // Populate Mint Infos from AMM Pools
     let mintInfos: ReturnTypeFetchMultipleMintInfos = {};
     // amm doesn't support token2022 yet, so don't need to fetch mint info
     Object.values(ammSimulateCache).forEach((p) => {
@@ -673,12 +841,13 @@ export default class TradeV2 extends ModuleBase {
       };
     });
 
-    console.log("fetching cpmm pools info, total: ", routes.cpmmPoolList.length);
+    // Fetch CPMM Pools Info
     const cpmmPoolsRpcInfo = await this.scope.cpmm.getRpcPoolInfos(
       routes.cpmmPoolList.map((p) => p.id.toBase58()),
       true,
     );
 
+    console.log("fetching cpmm pools info, total: ", routes.cpmmPoolList.length);
     Object.values(cpmmPoolsRpcInfo).forEach((p) => {
       const [mintA, mintB] = [p.mintA.toBase58(), p.mintB.toBase58()];
       if (p.mintProgramA.equals(TOKEN_PROGRAM_ID)) {
@@ -712,16 +881,16 @@ export default class TradeV2 extends ModuleBase {
     });
 
     console.log("fetching mints info, total: ", mintSet.size);
-    const fetchMintInfoRes = await fetchMultipleMintInfos({
-      connection: this.scope.connection,
-      mints: Array.from(mintSet).map((m) => new PublicKey(m)),
-    });
+    // Fetch Remaining Mint Infos
+    if (mintSet.size > 0) {
+      const additionalMintInfos = await fetchMultipleMintInfos({
+        connection: this.scope.connection,
+        mints: Array.from(mintSet).map((m) => new PublicKey(m)),
+      });
+      mintInfos = { ...mintInfos, ...additionalMintInfos };
+    }
 
-    mintInfos = {
-      ...mintInfos,
-      ...fetchMintInfoRes,
-    };
-
+    // Compute CPMM and CLMM Data
     const computeCpmmData = this.scope.cpmm.toComputePoolInfos({
       pools: cpmmPoolsRpcInfo,
       mintInfos,
@@ -731,52 +900,46 @@ export default class TradeV2 extends ModuleBase {
     const clmmPoolsRpcInfo = await this.scope.clmm.getRpcClmmPoolInfos({
       poolIds: routes.needTickArray.map((p) => p.id),
     });
+
     const { computeClmmPoolInfo, computePoolTickData } = await this.scope.clmm.getComputeClmmPoolInfos({
       clmmPoolsRpcInfo,
       mintInfos,
     });
 
-    // update route pool mint info
-    const routePathDict = Object.keys(routes.routePathDict).reduce((acc, cur) => {
-      return {
-        ...acc,
-        [cur]: {
-          ...routes.routePathDict[cur],
-          mintProgram: mintInfos[cur].programId,
-          mDecimals: mintInfos[cur].decimals,
-          in: routes.routePathDict[cur].in.map(
-            (p) =>
-              ammSimulateCache[p.id.toBase58()] ||
-              computeClmmPoolInfo[p.id.toBase58()] ||
-              computeCpmmData[p.id.toBase58()],
-          ),
-          out: routes.routePathDict[cur].out.map(
-            (p) =>
-              ammSimulateCache[p.id.toBase58()] ||
-              computeClmmPoolInfo[p.id.toBase58()] ||
-              computeCpmmData[p.id.toBase58()],
-          ),
-        },
-      };
-    }, {} as ComputeRoutePathType);
+    // Update Route Path Dict
+    const routePathDict = Object.keys(routes.routePathDict).reduce((acc, cur) => ({
+      ...acc,
+      [cur]: {
+        ...routes.routePathDict[cur],
+        mintProgram: mintInfos[cur].programId,
+        mDecimals: mintInfos[cur].decimals,
+        in: routes.routePathDict[cur].in.map(
+          (p) =>
+            ammSimulateCache[p.id.toBase58()] ||
+            computeClmmPoolInfo[p.id.toBase58()] ||
+            computeCpmmData[p.id.toBase58()],
+        ),
+        out: routes.routePathDict[cur].out.map(
+          (p) =>
+            ammSimulateCache[p.id.toBase58()] ||
+            computeClmmPoolInfo[p.id.toBase58()] ||
+            computeCpmmData[p.id.toBase58()],
+        ),
+      },
+    }), {} as ComputeRoutePathType);
 
     return {
       mintInfos,
-
       ammPoolsRpcInfo,
       ammSimulateCache,
-
       clmmPoolsRpcInfo,
       computeClmmPoolInfo,
       computePoolTickData,
-
       computeCpmmData,
-
       routePathDict,
     };
   }
 
-  // compute amount from routes
   public getAllRouteComputeAmountOut({
     inputTokenAmount,
     outputToken: propOutputToken,
@@ -793,20 +956,18 @@ export default class TradeV2 extends ModuleBase {
     routePathDict: ComputeRoutePathType;
     simulateCache: ReturnTypeFetchMultipleInfo;
     tickCache: ReturnTypeFetchMultiplePoolTickArrays;
-
     mintInfos: ReturnTypeFetchMultipleMintInfos;
-
     inputTokenAmount: TokenAmount;
     outputToken: ApiV3Token;
     slippage: number;
     chainTime: number;
     epochInfo: EpochInfo;
-
     feeConfig?: {
       feeBps: BN;
       feeAccount: PublicKey;
     };
   }): ComputeAmountOutLayout[] {
+    // Menghitung fee jika ada
     const _amountInFee =
       feeConfig === undefined
         ? new BN(0)
@@ -817,37 +978,42 @@ export default class TradeV2 extends ModuleBase {
       feeConfig === undefined
         ? undefined
         : {
-            feeAmount: _amountInFee,
-            feeAccount: feeConfig.feeAccount,
-          };
+          feeAmount: _amountInFee,
+          feeAccount: feeConfig.feeAccount,
+        };
+
+    // Menyesuaikan output token
     const outputToken = {
       ...propOutputToken,
       address: solToWSol(propOutputToken.address).toString(),
     };
+
     const outRoute: ComputeAmountOutLayout[] = [];
+
+    // Proses rute langsung (directPath)
     for (const itemPool of directPath) {
       try {
+        const directAmountOut = this.computeAmountOut({
+          itemPool,
+          tickCache,
+          simulateCache,
+          chainTime,
+          epochInfo,
+          slippage,
+          outputToken,
+          amountIn,
+        });
         outRoute.push({
-          ...this.computeAmountOut({
-            itemPool,
-            tickCache,
-            simulateCache,
-            chainTime,
-            epochInfo,
-            slippage,
-            outputToken,
-            amountIn,
-          }),
+          ...directAmountOut,
           feeConfig: _inFeeConfig,
         });
       } catch (e: any) {
         this.logDebug("direct error", itemPool.version, itemPool.id.toString(), e.message);
-        /* empty */
       }
     }
-    this.logDebug("direct done");
+
+    // Proses rute melalui path (routePathDict)
     for (const [routeMint, info] of Object.entries(routePathDict)) {
-      // const routeToken = new Token(info.mintProgram, routeMint, info.mDecimals);
       const routeToken = {
         chainId: 101,
         address: routeMint,
@@ -859,21 +1025,24 @@ export default class TradeV2 extends ModuleBase {
         tags: [],
         extensions: {},
       };
+
+      // Memilih rute masuk dengan hasil maksimal
       const maxFirstIn = info.in
         .map((i) => {
           try {
+            const amountOutData = this.computeAmountOut({
+              itemPool: i,
+              tickCache,
+              simulateCache,
+              chainTime,
+              epochInfo,
+              slippage,
+              outputToken: routeToken,
+              amountIn,
+            });
             return {
               pool: i,
-              data: this.computeAmountOut({
-                itemPool: i,
-                tickCache,
-                simulateCache,
-                chainTime,
-                epochInfo,
-                slippage,
-                outputToken: routeToken,
-                amountIn,
-              }),
+              data: amountOutData,
             };
           } catch (e: any) {
             this.logDebug("route in error", i.version, i.id.toString(), e.message);
@@ -885,11 +1054,15 @@ export default class TradeV2 extends ModuleBase {
           const b = _b === undefined ? ZERO : _b.data.amountOut.amount.raw.sub(_b.data.amountOut.fee?.raw ?? ZERO);
           return a.lt(b) ? 1 : -1;
         })[0];
+
       if (maxFirstIn === undefined) continue;
+
       const routeAmountIn = new TokenAmount(
         toToken(routeToken),
         maxFirstIn.data.amountOut.amount.raw.sub(maxFirstIn.data.amountOut.fee?.raw ?? ZERO),
       );
+
+      // Proses keluar (out) untuk setiap rute
       for (const iOutPool of info.out) {
         try {
           const outC = this.computeAmountOut({
@@ -902,13 +1075,14 @@ export default class TradeV2 extends ModuleBase {
             outputToken,
             amountIn: routeAmountIn,
           });
+
+          // Menambahkan hasil keluar (out) ke hasil akhir dengan harga terbaik dan dampak harga (priceImpact)
           outRoute.push({
             ...outC,
             allTrade: maxFirstIn.data.allTrade && outC.allTrade ? true : false,
             amountIn: maxFirstIn.data.amountIn,
             amountOut: outC.amountOut,
             minAmountOut: outC.minAmountOut,
-            currentPrice: undefined,
             executionPrice: new Decimal(
               new Price({
                 baseToken: maxFirstIn.data.amountIn.amount.token,
@@ -924,9 +1098,9 @@ export default class TradeV2 extends ModuleBase {
             remainingAccounts: [maxFirstIn.data.remainingAccounts[0], outC.remainingAccounts[0]],
             minMiddleAmountFee: outC.amountOut.fee?.raw
               ? new TokenAmount(
-                  (maxFirstIn.data.amountOut.amount as TokenAmount).token,
-                  (maxFirstIn.data.amountOut.fee?.raw ?? ZERO).add(outC.amountOut.fee?.raw ?? ZERO),
-                )
+                (maxFirstIn.data.amountOut.amount as TokenAmount).token,
+                (maxFirstIn.data.amountOut.fee?.raw ?? ZERO).add(outC.amountOut.fee?.raw ?? ZERO),
+              )
               : undefined,
             middleToken: (maxFirstIn.data.amountOut.amount as TokenAmount).token,
             poolReady: maxFirstIn.data.poolReady && outC.poolReady,
@@ -936,18 +1110,18 @@ export default class TradeV2 extends ModuleBase {
           });
         } catch (e: any) {
           this.logDebug("route out error", iOutPool.version, iOutPool.id.toString(), e.message);
-          /* empty */
         }
       }
     }
 
+    // Filter hasil rute yang tidak dapat melakukan seluruh transaksi (allTrade)
     return outRoute
       .filter((i) => {
         if (!i.allTrade)
           this.logDebug(`pool ${i.poolInfoList.map((p) => p.id.toString()).join(",")} filter out since not all trade`);
         return i.allTrade;
       })
-      .sort((a, b) => (a.amountOut.amount.raw.sub(b.amountOut.amount.raw).gt(ZERO) ? -1 : 1));
+      .sort((a, b) => (a.amountOut.amount.raw.sub(b.amountOut.amount.raw).gt(ZERO) ? -1 : 1)); // Urutkan berdasarkan amountOut tertinggi
   }
 
   /** trade related utils */
@@ -993,13 +1167,17 @@ export default class TradeV2 extends ModuleBase {
         epochInfo,
         catchLiquidityInsufficient: true,
       });
+
+      // Peningkatan efisiensi CLMM
+      const enhancedExecutionPrice = new Decimal(executionPrice.toFixed()).mul(1 - slippage / 100);
+
       return {
         allTrade,
         amountIn: realAmountIn,
         amountOut,
         minAmountOut,
         currentPrice: new Decimal(currentPrice.toFixed()),
-        executionPrice: new Decimal(executionPrice.toFixed()),
+        executionPrice: enhancedExecutionPrice,
         priceImpact: new Decimal(priceImpact.toFixed()),
         fee: [fee],
         remainingAccounts: [remainingAccounts],
@@ -1063,6 +1241,10 @@ export default class TradeV2 extends ModuleBase {
           mintOut: outputToken.address,
           slippage,
         });
+
+      // Peningkatan penghitungan harga eksekusi untuk efisiensi pool CLMM
+      const adjustedExecutionPrice = executionPrice.mul(1 - slippage / 100);
+
       return {
         amountIn: { amount: amountIn, fee: undefined, expirationTime: undefined },
         amountOut: {
@@ -1082,7 +1264,7 @@ export default class TradeV2 extends ModuleBase {
           expirationTime: undefined,
         },
         currentPrice,
-        executionPrice,
+        executionPrice: adjustedExecutionPrice,
         priceImpact,
         fee: [new TokenAmount(amountIn.token, fee)],
         routeType: "amm",
